@@ -39,7 +39,8 @@ contract PledgePool is SafeTransfer {
         uint256 endTime;// 结束时间
         uint256 interestRate;// 池的固定利率，单位是1e8 (1e8)
         uint256 maxSupply;// 最大供应量, 池的最大限额
-        uint256 lendSupply;// 当前供应量
+        uint256 lendSupply;// 当前实际存款数额
+        uint256 borrowSupply;// 当前实际抵押的数额
         uint256 martgageRate;// 池的抵押率，单位是1e8 (1e8)
         address lendToken;// 借贷代币地址 借款方代币地址 (比如 BUSD..)
         address borrowToken;// 质押代币地址 借款方代币地址 (比如 BTC..)
@@ -69,6 +70,16 @@ contract PledgePool is SafeTransfer {
     }
     // 地址: (池索引: 借款用户信息)
     mapping (address => mapping (uint256 => LendInfo)) public userLendInfo;
+
+    // 借款用户信息
+    struct BorrowInfo {
+        uint256 stakeAmount;// 当前借款的质押金额
+        uint256 refundAmount;// 多余的退款金额
+        bool hasNoRefund;// 默认为false，false = 未退款，true = 已退款
+        bool hasNoClaim;// 默认为false，false = 未认领，true = 已认领
+    }
+    // 地址: (池索引: 借款用户信息)
+    mapping (address => mapping (uint256 => BorrowInfo)) public userBorrowInfo;
 
     /*
         创建质押池的两个条件:
@@ -103,7 +114,8 @@ contract PledgePool is SafeTransfer {
             jpCoin: IDebtToken(_jpToken),
             autoLiquidateThreshold: _autoLiquidateThreshold,
             state: defaultChoice,
-            lendSupply: 0
+            lendSupply: 0,
+            borrowSupply: 0
         }));
 
         // 初始化质押池数据信息并写入数组
@@ -131,6 +143,15 @@ contract PledgePool is SafeTransfer {
     event RefundLend(address indexed from, address indexed token, uint256 refund); 
     // 借出索赔事件，from是索赔者地址，token是索赔的代币地址，amount是索赔的数量
     event ClaimLend(address indexed from, address indexed token, uint256 amount); 
+    // 提取借出事件，from是提取者地址，token是提取的代币地址，amount是提取的数量，burnAmount是销毁的数量
+    event WithdrawLend(address indexed from, address indexed token, uint256 amount, uint256 burnAmount);
+    // 紧急借出提取事件，from是提取者地址，token是提取的代币地址，amount是提取的数量
+    event EmergencyLendWithdrawal(address indexed from, address indexed token, uint256 amount);
+    // 存款借入事件，from是借入者地址，token是借入的代币地址，amount是借入的数量，mintAmount是生成的数量
+    event DepositBorrow(address indexed from, address indexed token, uint256 amount, uint256 mintAmount); 
+    // 借入退款事件，from是退款者地址，token是退款的代币地址，refund是退款的数量
+    event RefundBorrow(address indexed from, address indexed token, uint256 refund);
+    
 
     // 设置费用
     function setFee(uint256 _lendFee, uint256 _borrowFee) external {
@@ -239,6 +260,113 @@ contract PledgePool is SafeTransfer {
         emit ClaimLend(msg.sender, pool.borrowToken, spAmount); 
     }
 
+    /**
+     * @dev 存款人取回本金和利息
+     * @notice 池的状态可能是完成或清算
+     * @param _pid 是池索引
+     * @param _spAmount 是销毁的sp数量
+     */
+    function withdrawLend(uint256 _pid, uint256 _spAmount) external stateFinishOrLiquidation(_pid) {
+        PoolBaseInfo storage pool = poolBaseInfo[_pid];
+        PoolDataInfo storage data = poolDataInfo[_pid];
+        require(_spAmount > 0, "withdrawLend: spAmount must greater than 0.");
+        // 销毁sp_token
+        pool.spCoin.burn(msg.sender, _spAmount);
+        // 计算销毁份额
+        uint256 totalSpAmount = data.settleAmountLend;
+        // sp份额 = _spAmount/totalSpAmount
+        uint256 spShare = _spAmount.mul(calDecimal).div(totalSpAmount);
+        // 如果池状态完成
+        if (pool.state == PoolState.FINISH) {
+            require(block.timestamp > pool.endTime, "withdrawLend: Pool is finish.");
+            // 赎回金额 = finishAmountLend * sp份额
+            uint256 redeemAmount = data.finishAmountLend.mul(spShare).div(calDecimal);
+            // 退款动作
+            _redeem(payable(msg.sender), pool.lendToken, redeemAmount);
+            emit WithdrawLend(msg.sender, pool.lendToken, redeemAmount, _spAmount);
+        }
+        // 如果池状态结算
+        if (pool.state == PoolState.LIQUIDATION) {
+            require(block.timestamp > pool.settleTime, "withdrawLend: Pool is liquidation.");
+            // 赎回金额
+            uint256 redeemAmount = data.liquidationAmountLend.mul(spShare).div(calDecimal);
+            // 退款动作
+            _redeem(payable(msg.sender), pool.lendToken, redeemAmount);
+            emit WithdrawLend(msg.sender, pool.lendToken, redeemAmount, _spAmount);
+        }
+    }
+
+    /**
+     * @dev 紧急提取贷款
+     * @notice 池状态必须是未完成
+     * @param _pid 是池索引
+     */
+    function emergencyLendWithdrawal(uint256 _pid) external stateUndone(_pid){
+        PoolBaseInfo storage pool = poolBaseInfo[_pid]; // 获取池的基本信息
+        require(pool.lendSupply > 0, "emergencLend: not withdrawal"); // 要求贷款供应大于0
+        // 贷款紧急提款
+        LendInfo storage lendInfo = userLendInfo[msg.sender][_pid]; // 获取用户的贷款信息
+        // 限制金额
+        require(lendInfo.stakeAmount > 0, "refundLend: not pledged"); // 要求质押金额大于0
+        require(!lendInfo.hasNoRefund, "refundLend: again refund"); // 要求没有退款
+        // 退款操作
+        _redeem(payable(msg.sender), pool.lendToken, lendInfo.stakeAmount); // 执行赎回操作
+        // 更新用户信息
+        lendInfo.hasNoRefund = true; // 设置没有退款为真
+        emit EmergencyLendWithdrawal(msg.sender, pool.lendToken, lendInfo.stakeAmount); // 触发紧急贷款提款事件
+    }
+
+    /**
+     * @dev 借款人质押操作
+     * @param _pid 是池子索引
+     * @param _stakeAmount 是用户质押的数量
+     */
+    function depositBorrow(uint256 _pid, uint256 _stakeAmount) external payable timeBefore(_pid) stateMatch(_pid) {
+        // 基础信息
+        PoolBaseInfo storage pool = poolBaseInfo[_pid]; // 获取池子基础信息
+        BorrowInfo storage borrowInfo = userBorrowInfo[msg.sender][_pid]; // 获取用户借款信息
+        // 动作
+        uint256 amount = getPayableAmount(pool.borrowToken, _stakeAmount); // 获取应付金额
+        require(amount > 0, "depositBorrow: deposit amount is zero"); // 要求质押金额大于0
+        // 保存信息
+        borrowInfo.hasNoClaim = false; // 设置用户未提取质押物
+        borrowInfo.hasNoRefund = false; // 设置用户未退款
+        // 更新信息
+        if (pool.borrowToken == address(0)) {// 如果借款代币是0地址(即ETH)
+            borrowInfo.stakeAmount = borrowInfo.stakeAmount.add(msg.value);// 更新用户质押金额
+            pool.borrowSupply = pool.borrowSupply.add(msg.value);// 更新池子借款供应量
+        } else {// 如果借款代币不是0地址 (即其他ERC20代币)
+            borrowInfo.stakeAmount = borrowInfo.stakeAmount.add(_stakeAmount);// 更新用户质押金额
+            pool.borrowSupply = pool.borrowSupply.add(_stakeAmount);// 更新池子借款供应量
+        }
+        emit DepositBorrow(msg.sender, pool.borrowToken, _stakeAmount, amount); // 触发质押借款事件
+    }
+
+    /**
+     * @dev 退还给借款人的过量存款，当借款人的质押量大于0，且借款供应量减去结算借款量大于0，且借款人没有退款时，计算退款金额并进行退款。
+     * @notice 池状态不等于匹配和未完成
+     * @param _pid 是池状态
+     */
+    function refundBorrow(uint256 _pid) external timeAfter(_pid) stateNotMatchUndone(_pid){
+        // 基础信息
+        PoolBaseInfo storage pool = poolBaseInfo[_pid]; // 获取池的基础信息
+        PoolDataInfo storage data = poolDataInfo[_pid]; // 获取池的数据信息
+        BorrowInfo storage borrowInfo = userBorrowInfo[msg.sender][_pid]; // 获取借款人的信息
+        // 条件
+        require(pool.borrowSupply.sub(data.settleAmountBorrow) > 0, "refundBorrow: not refund"); // 需要借款供应量减去结算借款量大于0
+        require(borrowInfo.stakeAmount > 0, "refundBorrow: not pledged"); // 需要借款人的质押量大于0
+        require(!borrowInfo.hasNoRefund, "refundBorrow: again refund"); // 需要借款人没有退款
+        // 计算用户份额
+        uint256 userShare = borrowInfo.stakeAmount.mul(calDecimal).div(pool.borrowSupply); // 用户份额等于借款人的质押量乘以计算小数点后的位数，然后除以借款供应量
+        uint256 refundAmount = (pool.borrowSupply.sub(data.settleAmountBorrow)).mul(userShare).div(calDecimal); // 退款金额等于（借款供应量减去结算借款量）乘以用户份额，然后除以计算小数点后的位数
+        // 动作
+        _redeem(payable(msg.sender),pool.borrowToken,refundAmount); // 赎回
+        // 更新用户信息
+        borrowInfo.refundAmount = borrowInfo.refundAmount.add(refundAmount); // 更新借款人的退款金额
+        borrowInfo.hasNoRefund = true; // 设置借款人已经退款
+        emit RefundBorrow(msg.sender, pool.borrowToken, refundAmount); // 触发退款事件
+    }
+
     // 校验: 当前时间 < 池的结算事件
     modifier timeBefore(uint256 _pid) {
         require(block.timestamp < poolBaseInfo[_pid].settleTime, "Less than this time.");
@@ -266,6 +394,12 @@ contract PledgePool is SafeTransfer {
     // 校验：池状态 == EXECUTION || FINISH || LIQUIDATION
     modifier stateNotMatchUndone(uint256 _pid) {
         require(poolBaseInfo[_pid].state == PoolState.EXECUTION || poolBaseInfo[_pid].state == PoolState.FINISH || poolBaseInfo[_pid].state == PoolState.LIQUIDATION,"state: not match and undone");
+        _;
+    }
+
+    // 校验：池状态 == UNDONE
+    modifier stateUndone(uint256 _pid) {
+        require(poolBaseInfo[_pid].state == PoolState.UNDONE,"state: state must be undone");
         _;
     }
 }
